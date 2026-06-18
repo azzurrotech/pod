@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>pod - HTML Form Database</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+<h1>pod</h1>
+<p>HTML Form Database & Query Engine</p>
+<a href="https://www.azzurro.tech" class="back">Go to Azzurro Technology</a>
+</header>
+<main>
+<section class="intro">
+<p>Browse registered forms, submit data, and query results. Create a new form using the builder below.</p>
+</section>
+<section class="builder">
+<h2>New Form</h2>
+<form id="form-builder" action="/create-form" method="POST">
+<input type="text" name="_form_name" placeholder="Form name" required class="name-input">
+<div id="fields-container">
+<div class="field-row">
+<input type="text" name="_field_name_0" placeholder="Field name" required>
+<select name="_field_type_0">
+<option value="text">text</option><option value="email">email</option><option value="number">number</option><option value="password">password</option><option value="url">url</option><option value="tel">tel</option><option value="date">date</option><option value="textarea">textarea</option>
+</select>
+<button type="button" class="remove-field" onclick="this.parentElement.remove()">x</button>
+</div>
+</div>
+<button type="button" id="add-field" class="button secondary">+ Add Field</button>
+<button type="submit" class="button">Create Form</button>
+</form>
+</section>
+<section class="forms-list">
+<h2>Registered Forms</h2>
+{{if .}}
+<div class="grid">
+{{range .}}
+<div class="card">
+<h3>{{.Name}}</h3>
+<p class="meta">ID: {{.ID}} &middot; {{len .Fields}} fields</p>
+<p class="meta">Created: {{.CreatedAt}}</p>
+<a href="/form/{{.ID}}" class="button">View Form</a>
+<a href="/submissions/{{.ID}}" class="button secondary">Submissions</a>
+</div>
+{{end}}
+</div>
+{{else}}
+<p class="empty">No forms registered yet. Create one above.</p>
+{{end}}
+</section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

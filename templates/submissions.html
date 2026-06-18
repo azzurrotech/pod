@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{.Schema.Name}} - Submissions</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+<h1>{{.Schema.Name}} — Submissions</h1>
+<p>{{len .Submissions}} total submissions</p>
+<a href="/form/{{.Schema.ID}}" class="back">Back to Form</a>
+<a href="/" class="back" style="left:auto;right:1rem;">All Forms</a>
+</header>
+<main>
+{{if .Submissions}}
+<table>
+<thead>
+<tr>
+{{range .Schema.Fields}}<th>{{.Label}}</th>{{end}}
+<th>Submitted</th>
+</tr>
+</thead>
+<tbody>
+{{range .Submissions}}
+{{$sub := .}}
+<tr>
+{{range $.Schema.Fields}}<td>{{index $sub.Data .Name}}</td>{{end}}
+<td>{{$sub.CreatedAt}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p class="empty">No submissions yet.</p>
+{{end}}
+</main>
+</body>
+</html>
