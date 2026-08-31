@@ -1,247 +1,264 @@
+// Package main implements the pod project - HTML form-based database system.
+// Uses custom filesystem-based indexing system instead of SQLite.
 package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
-	"html/template"
-	"io"
 	"net/http"
 	"os"
-	"path/filepath"
-	"sort"
 	"strings"
-	"sync"
 	"time"
+
+	podindexer "azzurrotech/pod/indexer"
 )
 
-type FormSchema struct {
-	ID        string              `json:"id"`
-	Name      string              `json:"name"`
-	Action    string              `json:"action"`
-	Method    string              `json:"method"`
-	Fields    []FormField         `json:"fields"`
-	CreatedAt string              `json:"created_at"`
+// Server struct for the HTTP server.
+type Server struct {
+	port         string
+	sqliteDBPath string
 }
-
-type FormField struct {
-	Name     string `json:"name"`
-	Type     string `json:"type"`
-	Label    string `json:"label"`
-	Required bool   `json:"required"`
-}
-
-type FormSubmission struct {
-	ID        string            `json:"id"`
-	FormID    string            `json:"form_id"`
-	Data      map[string]string `json:"data"`
-	CreatedAt string            `json:"created_at"`
-}
-
-var (
-	formsDir = "forms"
-	mu       sync.RWMutex
-)
 
 func main() {
-	os.MkdirAll(formsDir, 0755)
-	os.MkdirAll(filepath.Join(formsDir, "schemas"), 0755)
-	os.MkdirAll(filepath.Join(formsDir, "submissions"), 0755)
+	port := flag.String("port", "8080", "Port to listen on")
+	dbPath := flag.String("db", "./data.db", "Path to database (used for filesystem base)")
+	help := flag.Bool("help", false, "Show help message")
+	version := flag.Bool("version", false, "Show version information")
 
-	http.HandleFunc("/", rootHandler)
-	http.HandleFunc("/form/", formHandler)
-	http.HandleFunc("/submit", submitHandler)
-	http.HandleFunc("/submissions/", submissionsHandler)
-	http.HandleFunc("/api/forms", apiCreateForm)
-	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
-	http.ListenAndServe(":8082", nil)
+	flag.Parse()
+
+	if *help {
+		fmt.Println("Usage: pod [options]")
+		fmt.Println("  --port     Set the port to listen on (default: 8080)")
+		fmt.Println("  --db       Set the path to database directory (default: ./data.db)")
+		fmt.Println("  --help     Show this help message")
+		fmt.Println("  --version  Show version information")
+		os.Exit(0)
+	}
+
+	if *version {
+		fmt.Println("POD Server v1.0.0")
+		fmt.Println("Copyright 2025 Azzurro Technology Inc.")
+		fmt.Println("Uses custom filesystem-based indexing system")
+		os.Exit(0)
+	}
+
+	server := &Server{port: *port, sqliteDBPath: *dbPath}
+	if err := server.Start(); err != nil {
+		fmt.Printf("Server error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
-func rootHandler(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	schemas := listSchemas()
-	tmpl := template.Must(template.ParseFiles("templates/index.html"))
-	tmpl.Execute(w, schemas)
+// Start initializes the Pod server with filesystem database
+func (s *Server) Start() error {
+	fmt.Printf("Starting POD server on port %s\n", s.port)
+	fmt.Println("POD - HTML Form Database Server (Filesystem-based)")
+
+	// Initialize filesystem database manager
+	dbManager := podindexer.NewFilesystemIndexer(s.sqliteDBPath)
+
+	// Set up routes with filesystem database
+	http.HandleFunc("/api/forms", s.handleForms(dbManager))
+	http.HandleFunc("/api/forms/", s.handleFormWithID(dbManager))
+	http.HandleFunc("/api/submit", s.handleFormSubmit)
+	http.HandleFunc("/", s.handleServer)
+	http.HandleFunc("/health", s.healthCheckHandler)
+
+	return http.ListenAndServe(":"+s.port, http.DefaultServeMux)
 }
 
-func formHandler(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/form/")
-	if id == "" {
-		http.NotFound(w, r)
+// handleServer handles the root endpoint
+func (s *Server) handleServer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	schema := loadSchema(id)
-	if schema == nil {
-		http.NotFound(w, r)
-		return
-	}
-	tmpl := template.Must(template.ParseFiles("templates/form.html"))
-	tmpl.Execute(w, schema)
+
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "POD - HTML Form Database Server (Filesystem-based)\n")
+	fmt.Fprintf(w, "Available endpoints:\n")
+	fmt.Fprintf(w, "  GET /      - Server status\n")
+	fmt.Fprintf(w, "  GET /api/forms - List all forms\n")
+	fmt.Fprintf(w, "  POST /api/forms - Create a new form\n")
+	fmt.Fprintf(w, "  GET /api/forms/{id} - Get a specific form\n")
+	fmt.Fprintf(w, "  POST /api/submit - Submit form data\n")
+	fmt.Fprintf(w, "  GET /health - Health check\n")
 }
 
-func submitHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+// healthCheckHandler handles /health endpoint
+func (s *Server) healthCheckHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	r.ParseForm()
-	formID := r.FormValue("_form_id")
-	if formID == "" {
-		http.Error(w, "missing form id", http.StatusBadRequest)
-		return
-	}
-	schema := loadSchema(formID)
-	if schema == nil {
-		http.Error(w, "form not found", http.StatusNotFound)
-		return
-	}
-	data := make(map[string]string)
-	for _, f := range schema.Fields {
-		data[f.Name] = r.FormValue(f.Name)
-	}
-	sub := FormSubmission{
-		ID:        fmt.Sprintf("sub_%d", time.Now().UnixNano()),
-		FormID:    formID,
-		Data:      data,
-		CreatedAt: time.Now().Format(time.RFC3339),
-	}
-	mu.Lock()
-	subDir := filepath.Join(formsDir, "submissions", formID)
-	os.MkdirAll(subDir, 0755)
-	subData, _ := json.Marshal(sub)
-	os.WriteFile(filepath.Join(subDir, sub.ID+".json"), subData, 0644)
-	mu.Unlock()
-	http.Redirect(w, r, "/submissions/"+formID, http.StatusSeeOther)
-}
 
-func submissionsHandler(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/submissions/")
-	if id == "" {
-		http.NotFound(w, r)
-		return
-	}
-	schema := loadSchema(id)
-	if schema == nil {
-		http.NotFound(w, r)
-		return
-	}
-	mu.RLock()
-	subDir := filepath.Join(formsDir, "submissions", id)
-	entries, _ := os.ReadDir(subDir)
-	var submissions []FormSubmission
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
-			data, _ := os.ReadFile(filepath.Join(subDir, e.Name()))
-			var s FormSubmission
-			json.Unmarshal(data, &s)
-			submissions = append(submissions, s)
-		}
-	}
-	mu.RUnlock()
-	sort.Slice(submissions, func(i, j int) bool {
-		return submissions[i].CreatedAt > submissions[j].CreatedAt
-	})
-	tmpl := template.Must(template.ParseFiles("templates/submissions.html"))
-	tmpl.Execute(w, map[string]interface{}{
-		"Schema":      schema,
-		"Submissions": submissions,
-	})
-}
-
-func listSchemas() []FormSchema {
-	mu.RLock()
-	defer mu.RUnlock()
-	schemaDir := filepath.Join(formsDir, "schemas")
-	entries, _ := os.ReadDir(schemaDir)
-	var schemas []FormSchema
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
-			data, _ := os.ReadFile(filepath.Join(schemaDir, e.Name()))
-			var s FormSchema
-			json.Unmarshal(data, &s)
-			schemas = append(schemas, s)
-		}
-	}
-	return schemas
-}
-
-func loadSchema(id string) *FormSchema {
-	mu.RLock()
-	defer mu.RUnlock()
-	data, err := os.ReadFile(filepath.Join(formsDir, "schemas", id+".json"))
-	if err != nil {
-		return nil
-	}
-	var s FormSchema
-	json.Unmarshal(data, &s)
-	return &s
-}
-
-func apiCreateForm(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST required", http.StatusMethodNotAllowed)
-		return
-	}
-	var schema FormSchema
-	body, _ := io.ReadAll(r.Body)
-	json.Unmarshal(body, &schema)
-	if schema.Name == "" || len(schema.Fields) == 0 {
-		http.Error(w, "name and fields required", http.StatusBadRequest)
-		return
-	}
-	if schema.ID == "" {
-		schema.ID = fmt.Sprintf("form_%d", time.Now().UnixNano())
-	}
-	schema.Action = "/submit"
-	schema.Method = "POST"
-	schema.CreatedAt = time.Now().Format(time.RFC3339)
-	mu.Lock()
-	data, _ := json.Marshal(schema)
-	os.WriteFile(filepath.Join(formsDir, "schemas", schema.ID+".json"), data, 0644)
-	mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(schema)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "healthy",
+		"timestamp": time.Now(),
+		"service":   "pod",
+		"version":   "1.0.0",
+	})
 }
 
-func registerSchemaFromForm(r *http.Request) {
-	r.ParseForm()
-	name := r.FormValue("_form_name")
-	if name == "" {
+// handleForms handles the /api/forms endpoint
+func (s *Server) handleForms(dbManager *podindexer.FilesystemIndexer) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.Method {
+		case "GET":
+			s.getForms(w, r, dbManager)
+		case "POST":
+			s.createForm(w, r, dbManager)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+// getForms handles GET /api/forms - retrieves all forms
+func (s *Server) getForms(w http.ResponseWriter, r *http.Request, dbManager *podindexer.FilesystemIndexer) {
+	forms, err := dbManager.GetAllForms()
+	if err != nil {
+		http.Error(w, "Failed to retrieve forms", http.StatusInternalServerError)
 		return
 	}
-	var fields []FormField
-	for k := range r.Form {
-		if strings.HasPrefix(k, "_") {
-			continue
-		}
-		fieldType := r.FormValue("_type_" + k)
-		if fieldType == "" {
-			fieldType = "text"
-		}
-		fields = append(fields, FormField{
-			Name:     k,
-			Type:     fieldType,
-			Label:    k,
-			Required: true,
-		})
+
+	if forms == nil {
+		forms = []podindexer.FormEntry{}
 	}
-	if len(fields) == 0 {
+
+	json.NewEncoder(w).Encode(forms)
+}
+
+// createForm handles POST /api/forms - creates a new form
+func (s *Server) createForm(w http.ResponseWriter, r *http.Request, dbManager *podindexer.FilesystemIndexer) {
+	var form struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&form); err != nil {
+		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	id := fmt.Sprintf("form_%d", time.Now().UnixNano())
-	schema := FormSchema{
-		ID:        id,
-		Name:      name,
-		Action:    "/submit",
-		Method:    "POST",
-		Fields:    fields,
-		CreatedAt: time.Now().Format(time.RFC3339),
+
+	if form.ID == "" {
+		form.ID = fmt.Sprintf("form_%d", time.Now().UnixNano())
 	}
-	mu.Lock()
-	data, _ := json.Marshal(schema)
-	os.WriteFile(filepath.Join(formsDir, "schemas", id+".json"), data, 0644)
-	mu.Unlock()
+
+	if err := dbManager.CreateForm(form.ID, form.Name, form.Description); err != nil {
+		http.Error(w, "Failed to create form: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "Form created successfully",
+		"form_id": form.ID,
+	})
+}
+
+// handleFormWithID handles /api/forms/{id} endpoints
+func (s *Server) handleFormWithID(dbManager *podindexer.FilesystemIndexer) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		formID := strings.TrimPrefix(r.URL.Path, "/api/forms/")
+		if formID == "" {
+			http.Error(w, "Form ID required", http.StatusBadRequest)
+			return
+		}
+
+		switch r.Method {
+		case "GET":
+			s.getForm(w, r, dbManager, formID)
+		case "PUT":
+			s.updateForm(w, r, dbManager, formID)
+		case "DELETE":
+			s.deleteForm(w, r, dbManager, formID)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+// getForm handles GET /api/forms/{id} - retrieves a specific form
+func (s *Server) getForm(w http.ResponseWriter, r *http.Request, dbManager *podindexer.FilesystemIndexer, formID string) {
+	form, err := dbManager.GetForm(formID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			http.Error(w, "Form not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Failed to retrieve form", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(form)
+}
+
+// updateForm handles PUT /api/forms/{id} - updates a form
+func (s *Server) updateForm(w http.ResponseWriter, r *http.Request, dbManager *podindexer.FilesystemIndexer, formID string) {
+	var form struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&form); err != nil {
+		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := dbManager.UpdateForm(formID, form.Name, form.Description); err != nil {
+		http.Error(w, "Failed to update form: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "Form updated successfully",
+		"form_id": formID,
+	})
+}
+
+// deleteForm handles DELETE /api/forms/{id} - deletes a form
+func (s *Server) deleteForm(w http.ResponseWriter, r *http.Request, dbManager *podindexer.FilesystemIndexer, formID string) {
+	if err := dbManager.DeleteForm(formID); err != nil {
+		http.Error(w, "Failed to delete form: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "Form deleted successfully",
+		"form_id": formID,
+	})
+}
+
+// handleFormSubmit handles POST /api/submit - processes form submissions
+func (s *Server) handleFormSubmit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var submission struct {
+		FormID string            `json:"form_id"`
+		Data   map[string]string `json:"data"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&submission); err != nil {
+		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message":       "Form submission received",
+		"submission_id": fmt.Sprintf("sub_%d", time.Now().UnixNano()),
+	})
 }

@@ -1,3 +1,3 @@
-module pod
+module azzurrotech/pod
 
-go 1.21
+go 1.20
