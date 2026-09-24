@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pod — {{.Title}}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 50rem; margin: 0 auto; padding: 1rem; line-height: 1.45; }
+  a { color: #2563eb; }
+  .box { border: 1px solid #ccc; border-radius: .5rem; padding: 1rem 1.25rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="{{.Mount}}/">pod</a> / {{.Title}}</h1>
+</header>
+<div class="box">
+  <p>{{.Message}}</p>
+  <p><a href="{{.Mount}}/">← back to tables</a></p>
+</div>
+</body>
+</html>

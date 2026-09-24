@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	podindexer "azzurrotech/pod/indexer"
+	podindexer "azzurrotech/pod/legacy/current_gen/indexer"
 )
 
 // Server struct for the HTTP server.

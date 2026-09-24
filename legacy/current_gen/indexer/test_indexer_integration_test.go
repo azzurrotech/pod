@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"azzurrotech/pod/indexer"
+	"azzurrotech/pod/legacy/current_gen/indexer"
 )
 
 func TestFilesystemIndexer_CreateTable(t *testing.T) {

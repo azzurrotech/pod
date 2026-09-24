@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pod — {{.Table}}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 80rem; margin: 0 auto; padding: 1rem; line-height: 1.45; }
+  a { color: #2563eb; }
+  .notice { background: #d1fae5; border: 1px solid #6ee7b7; border-radius: .5rem; padding: .5rem .75rem; }
+  form { display: grid; gap: .5rem; max-width: 60rem; }
+  fieldset { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: .5rem; border: 1px solid #ccc; border-radius: .5rem; }
+  label { display: grid; font-size: .85rem; color: #444; }
+  input, select, button { font: inherit; padding: .3rem .5rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { border: 1px solid #ddd; padding: .35rem .5rem; text-align: left; vertical-align: top; }
+  th { background: #f2f2f2; }
+  .inline-del { display: inline; }
+  button.link { background: none; border: none; color: #2563eb; cursor: pointer; padding: 0; font: inherit; }
+  .pager { display: flex; align-items: center; gap: 1rem; margin: 1rem 0; }
+  .pager .off { color: #999; }
+  .new-record { margin-top: 2rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="{{.Mount}}/">pod</a> / {{.Table}}</h1>
+  {{if .Notice}}<p class="notice">{{.Notice}}</p>{{end}}
+  <p>
+    <a href="{{.Href}}?format=json">JSON</a> ·
+    <a href="{{.Href}}?format=xml">XML</a> ·
+    <a href="{{.Mount}}/schema/{{esc .Table}}?format=json">schema</a> ·
+    <a href="{{.Mount}}/sql?sql=SELECT%20*%20FROM%20&#39;{{.Table}}&#39;">SQL</a>
+  </p>
+</header>
+
+<form method="get" action="{{.Href}}">
+  <fieldset>
+    <legend>Filter</legend>
+    {{range .Schema}}
+    <label>{{.Name}}
+      <input type="search" name="{{.Name}}" value="{{index $.Filters .Name}}">
+    </label>
+    {{end}}
+    <label>Search all fields
+      <input type="search" name="q" value="{{.Q}}">
+    </label>
+    <label>Order by
+      <input type="text" name="orderby" value="{{.OrderBy}}">
+    </label>
+    <label>Direction
+      <select name="dir">
+        <option value="asc"{{if eq .Dir "desc"}}{{else}} selected{{end}}>asc</option>
+        <option value="desc"{{if eq .Dir "desc"}} selected{{end}}>desc</option>
+      </select>
+    </label>
+    <label>Limit
+      <input type="number" name="limit" min="1" value="{{if .Limit}}{{.Limit}}{{end}}" placeholder="no limit">
+    </label>
+  </fieldset>
+  <div>
+    <button type="submit">Query</button>
+    <a href="{{.Href}}" style="margin-left:.5rem">reset</a>
+  </div>
+</form>
+
+<h2>Records</h2>
+{{if .Records}}
+<table class="records">
+  <thead>
+    <tr><th>id</th>{{range .Schema}}<th>{{.Name}}</th>{{end}}<th></th></tr>
+  </thead>
+  <tbody>
+  {{range .Records}}
+    {{$rec := .}}
+    <tr>
+      <td><a href="{{$.Mount}}/record/{{esc $.Table}}/{{esc $rec.ID}}">{{$rec.ID}}</a></td>
+      {{range $.Schema}}<td>{{field $rec .Name}}</td>{{end}}
+      <td>
+        <form method="post" action="{{$.Mount}}/record/{{esc $.Table}}/{{esc $rec.ID}}" class="inline-del">
+          <input type="hidden" name="_action" value="delete">
+          <button type="submit" class="link" onclick="return confirm('Delete {{$rec.ID}}?')">delete</button>
+        </form>
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<p>No records{{if .Filters}} match these filters{{end}}.</p>
+{{end}}
+
+<nav class="pager">
+  {{if .PrevURL}}<a href="{{.PrevURL}}">← prev</a>{{else}}<span class="off">← prev</span>{{end}}
+  <span>offset {{.Offset}}{{if .Limit}} · limit {{.Limit}}{{end}}</span>
+  {{if .NextURL}}<a href="{{.NextURL}}">next →</a>{{else}}<span class="off">next →</span>{{end}}
+</nav>
+
+<div class="new-record">
+<h2>Save a record</h2>
+<form method="post" action="{{.Href}}">
+  <label>id (optional — generated when empty)
+    <input type="text" name="id" placeholder="e.g. 1001">
+  </label>
+  {{range .Schema}}
+  <label>{{.Name}}{{if .Type}} ({{.Type}}){{end}}{{if .Default}} · default {{.Default}}{{end}}
+    <input type="text" name="{{.Name}}">
+  </label>
+  {{end}}
+  <div><button type="submit">Save record</button></div>
+</form>
+</div>
+
+<footer style="margin-top:2rem"><a href="{{.Mount}}/">← all tables</a></footer>
+</body>
+</html>

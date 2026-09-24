@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pod — tables</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 70rem; margin: 0 auto; padding: 1rem; line-height: 1.45; }
+  h1 { margin-bottom: 0; } header p { margin-top: 0; color: #666; }
+  ul.tables { list-style: none; padding: 0; display: grid; gap: .75rem; }
+  li.table { border: 1px solid #ccc; border-radius: .5rem; padding: .75rem 1rem; }
+  a { color: #2563eb; } .count { color: #666; font-size: .9rem; margin-left: .5rem; }
+  ul.cols { list-style: none; padding: 0; margin: .5rem 0 0; display: flex; flex-wrap: wrap; gap: .25rem 1rem; color: #444; font-size: .9rem; }
+  ul.cols .type { color: #888; }
+  form { display: grid; gap: .75rem; max-width: 46rem; }
+  fieldset { display: grid; gap: .5rem; border: 1px solid #ccc; border-radius: .5rem; }
+  .colrow { display: flex; gap: .5rem; } .colrow input:first-child { flex: 1; }
+  input, select, button { font: inherit; padding: .3rem .5rem; }
+  button { cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>pod</h1>
+  <p>HTML-form filesystem database — XML records in siloed directories</p>
+</header>
+
+<h2>Tables</h2>
+{{if .Tables}}
+<ul class="tables">
+{{range .Tables}}
+  <li class="table">
+    <a href="{{$.Mount}}/table/{{esc .Name}}">{{.Name}}</a>
+    <span class="count">{{.Count}} record{{if ne .Count 1}}s{{end}}</span>
+    {{if .Columns}}
+    <ul class="cols">
+    {{range .Columns}}<li>{{.Name}}{{if .Type}} <span class="type">({{.Type}})</span>{{end}}{{if .Default}} = {{.Default}}{{end}}</li>{{end}}
+    </ul>
+    {{end}}
+  </li>
+{{end}}
+</ul>
+{{else}}
+<p>No tables yet — create one below, or point a form at <code>{{.Mount}}/table/&lt;path&gt;</code> and submit a record.</p>
+{{end}}
+
+<h2>Create table</h2>
+<form method="post" action="{{.Mount}}/tables">
+  <label>Table path (use "/" for silos, e.g. <code>acme/contacts</code>)<br>
+    <input type="text" name="_table" required placeholder="acme/contacts">
+  </label>
+  <fieldset id="cols">
+    <legend>Columns</legend>
+    <div class="colrow">
+      <input type="text" name="_cname_0" placeholder="column name" required>
+      <select name="_ctype_0">
+        <option value="text" selected>text</option>
+        <option value="int">int</option>
+        <option value="float">float</option>
+        <option value="bool">bool</option>
+        <option value="date">date</option>
+      </select>
+      <input type="text" name="_cdefault_0" placeholder="default (optional)">
+    </div>
+  </fieldset>
+  <div>
+    <button type="button" id="addcol">+ column</button>
+    <button type="submit">Create table</button>
+  </div>
+</form>
+
+<footer style="margin-top:2rem">
+  <a href="{{.Mount}}/health">health</a> ·
+  <a href="{{.Mount}}/tables">tables API</a> ·
+  <a href="{{.Mount}}/sql?sql=">SQL console</a>
+</footer>
+
+<script>
+(function () {
+  var cols = document.getElementById('cols');
+  var addcol = document.getElementById('addcol');
+  var n = 1;
+  addcol.addEventListener('click', function () {
+    var row = document.createElement('div');
+    row.className = 'colrow';
+    row.innerHTML =
+      '<input type="text" name="_cname_' + n + '" placeholder="column name">' +
+      '<select name="_ctype_' + n + '">' +
+        '<option value="text" selected>text</option>' +
+        '<option value="int">int</option>' +
+        '<option value="float">float</option>' +
+        '<option value="bool">bool</option>' +
+        '<option value="date">date</option>' +
+      '</select>' +
+      '<input type="text" name="_cdefault_' + n + '" placeholder="default (optional)">';
+    cols.appendChild(row);
+    n++;
+  });
+})();
+</script>
+</body>
+</html>

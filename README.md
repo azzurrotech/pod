@@ -1,455 +1,175 @@
-# pod (HTML Form Database)
+# pod — HTML-form database on the filesystem
 
-**MIT License © Azzurro Technology Inc.**
+**MIT License © Azzurro Technology Inc.** — standard library only, zero external
+dependencies (`go.mod` is `require`-free).
 
-## Overview
+pod is a database that is driven by HTML forms. A record is a single XML file
+stored on disk inside a siloed directory, and the **destination URL of a form
+submission maps directly to the storage location**:
 
-pod is an HTML form-based database system that provides database functionality through web forms. It uses SQLite as a backup storage system requiring no schema or configuration setup, making it an intuitive and user-friendly database solution.
-
-## Installation
-
-### Prerequisites
-- Go 1.20+
-- SQLite with Go driver (github.com/mattn/go-sqlite3)
-
-### Installation Steps
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/azzurro-tech/pod.git
-   cd pod
-   ```
-
-2. Install Go dependencies:
-   ```bash
-   go mod download
-   ```
-
-3. Start the pod database:
-   ```bash
-   cd azzurrotech/pod
-   go run ./cmd
-   ```
-
-4. Access the pod web interface:
-   ```
-   http://localhost:8082
-   http://localhost:8082/pod/config
-   http://localhost:8082/pod/admin
-   ```
-
-## Usage (Standalone)
-
-### Basic Operations
-
-**Form Management**
-```bash
-# List all forms
-curl http://localhost:8082/api/forms
-
-# Create a new form
-curl -X POST http://localhost:8082/api/forms \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Contact Form","description":"User contact form","fields":[{"name":"name","type":"text","required":true}]}'
-
-# Get specific form
-curl http://localhost:8082/api/forms/{form-id}
-
-# Update form
-curl -X PUT http://localhost:8082/api/forms/{form-id} \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Updated Contact Form","description":"Updated form"}'
-
-# Delete form
-curl -X DELETE http://localhost:8082/api/forms/{form-id}
+```
+POST /table/acme/contacts  →  stores <base>/acme/contacts/<id>.xml
 ```
 
-**Form Submission**
-```bash
-# Submit form data
-curl -X POST http://localhost:8082/api/submit \
-  -H "Content-Type: application/json" \
-  -d '{"form_id":"contact-form","data":{"name":"John Doe","email":"john@example.com","message":"Hello World"}}'
+<record>
+  <field name="name">Jane</field>
+  <field name="age">30</field>
+</record>
 
-# Access form data
-curl http://localhost:8082/api/data
+Everything returns as **XML or JSON** (pick with `?format=json|xml` or Accept /
+Content-Type negotiation), and a small vanilla HTML form UI is served for
+browsers. There is no framework, no SQLite, no network database, no build
+step — `go build ./...` and `go test ./...` are the whole toolchain.
+
+## Modes
+
+### 1. Standalone server
+
+```sh
+go run ./cmd/pod -port 8080 -db ./data
 ```
 
-### API Endpoints
+Flags:
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Main pod status page |
-| `/pod` | GET | HTML config viewer |
-| `/pod/config` | GET | View configuration |
-| `/pod/config` | POST | Update configuration |
-| `/pod/admin` | GET | HTML admin panel |
-| `/pod/admin` | POST | Update admin settings |
-| `/api/forms` | GET | List all forms |
-| `/api/forms` | POST | Create new form |
-| `/api/forms/{id}` | GET | Get specific form |
-| `/api/forms/{id}` | PUT | Update form |
-| `/api/forms/{id}` | DELETE | Delete form |
-| `/api/submit` | POST | Submit form data |
-| `/api/data` | GET | Access form data |
-| `/health` | GET | Health check |
+| Flag | Default | Meaning |
+|---|---|---|
+| `-port` | `8080` | HTTP listen port |
+| `-db` | `./data` | base directory for the filesystem database (silos) |
+| `-mount` | `/` | URL prefix to serve under (use `/` standalone) |
+| `-ui` | `true` | serve the embedded HTML form interface |
+| `-index-interval` | `5s` | indexer sync interval (`0` disables) |
+| `-normalize-interval` | `30s` | normalizer run interval (`0` disables) |
+| `-version` | — | print `pod <version>` and exit |
 
-## Integration with ATP
-
-### Service Registration
-
-pod registers with ATP as a database service that provides HTML form-based database functionality:
+### 2. Middleware mode (import the library)
 
 ```go
-// Example pod service registration
-package main
+import "azzurrotech/pod"
 
-import "github.com/gin-gonic/gin"
-
-func main() {
-    r := gin.Default()
-    
-    // Health check endpoint
-    r.GET("/health", func(c *gin.Context) {
-        c.JSON(200, gin.H{"status": "healthy"})
-    })
-    
-    // Forms API
-    forms := r.Group("/api/forms")
-    {
-        forms.GET("/", getAllForms)
-        forms.POST("/", createForm)
-        forms.GET("/{id}", getForm)
-        forms.PUT("/{id}", updateForm)
-        forms.DELETE("/{id}", deleteForm)
-    }
-    
-    // Form submission API
-    submit := r.Group("/api")
-    {
-        submit.POST("/submit", submitForm)
-    }
-    
-    // Data access API
-    data := r.Group("/api")
-    {
-        data.GET("/data", getFormData)
-    }
-    
-    // Service registration with ATP
-    r.POST("/register", func(c *gin.Context) {
-        config := map[string]interface{}{
-            "name": "pod",
-            "endpoint": "http://localhost:8082",
-            "health": "/health",
-            "forms_endpoint": "/api/forms",
-            "submit_endpoint": "/api/submit",
-            "data_endpoint": "/api/data"
-        }
-        
-        response, err := registerWithATP(config)
-        if err != nil {
-            c.JSON(500, gin.H{"error": "registration failed"})
-            return
-        }
-        
-        c.JSON(200, response)
-    })
-    
-    r.Run(":8082")
-}
+st, _ := pod.Open("./data") // one shared index per base path
+h := pod.NewHandler(pod.HandlerOptions{
+    Store: st,
+    Mount: "/pod",     // default "/pod"
+    // UI defaults to enabled; pass pod.Ptr(false) to disable
+})
+http.Handle("/pod", h)
+h.RunBackground(ctx, 5*time.Second, 30*time.Second) // indexer + normalizer
 ```
 
-### Database Integration
-
-pod integrates with ATP for centralized database management:
-
-```yaml
-# atp/config/integrations.yaml
-integrations:
-  azzurrotech:
-    pod:
-      health_check: /health
-      forms_endpoint: /api/forms
-      submit_endpoint: /api/submit
-      data_endpoint: /api/data
-      config_endpoint: /api/pod/config
-      admin_endpoint: /api/pod/admin
-      auth_required: true
-```
-
-### Form Management Pipeline
-
-1. **Form Creation**: Users create forms through web interface or API
-2. **Form Storage**: Forms are stored in SQLite database
-3. **Form Submission**: Users submit data through HTML forms
-4. **Data Storage**: Submitted data is stored in database
-5. **Data Access**: Data is accessed through REST API
-6. **Data Integration**: Data is distributed through ATP APIs
-
-## Development Setup
-
-### Local Development
-
-```bash
-# Start pod server
-cd azzurrotech/pod
-go run ./cmd
-
-# Or with environment variables
-cd azzurrotech/pod
-export POD_PORT=8082
-export DB_PATH=./data/pod.db
-go run ./cmd
-```
-
-### Testing
-
-```bash
-# Run all tests
-cd azzurrotech/pod
-go test ./...
-
-# Run specific test packages
-cd azzurrotech/pod
-go test ./internal/db/...
-go test ./internal/services/...
-
-# Run integration tests
-cd azzurrotech/pod
-go test ./integration/...
-
-# Test API endpoints
-curl http://localhost:8082/health
-curl http://localhost:8082/api/forms
-curl "http://localhost:8082/api/forms?limit=10"
-```
-
-### Building
-
-```bash
-# Build for production
-cd azzurrotech/pod
-go build -o pod ./cmd
-
-# Build with specific options
-cd azzurrotech/pod
-go build -ldflags="-port=8082" -o pod ./cmd
-
-# Build with SQLite configuration
-cd azzurrotech/pod
-DB_PATH=./data/pod.db go run ./cmd
-```
-
-## Performance Optimization
-
-### Database Optimization
-
-- **SQLite Optimization**: Optimized SQLite configuration
-- **Connection Pooling**: Efficient database connection management
-- **Query Optimization**: Optimized SQL queries
-- **Indexing**: Database indexing for performance
-- **Backup**: Automated database backup
-
-### Memory Management
+The same package also registers a Go `database/sql` driver:
 
 ```go
-// Database connection optimization
-var db *sql.DB
-
-func initDatabase() {
-    var err error
-    // SQLite configuration
-    db, err = sql.Open("sqlite3", "./data/pod.db")
-    if err != nil {
-        log.Fatal("Database connection failed")
-    }
-    
-    // Set connection pool settings
-    db.SetMaxOpenConns(10)
-    db.SetMaxIdleConns(5)
-    db.SetConnMaxLifetime(time.Hour)
-    
-    // Enable WAL mode for better performance
-    db.Exec("PRAGMA journal_mode=WAL")
-    db.Exec("PRAGMA synchronous=NORMAL")
-    db.Exec("PRAGMA cache_size=10000")
-}
+import "database/sql"
+db, _ := sql.Open("pod", "./data")
 ```
 
-## Monitoring
+## How data is stored
 
-### Health Monitoring
+- One directory per table. Table paths may contain `/` to create silos
+  (`acme/contacts`, `acme/invoices`). The URL destination path **is** the
+  storage path — no mapping table.
+- One XML file per record: `<base>/<table>/<id>.xml`.
+- Writes are atomic (temp file + rename), so readers never see partial files.
+- An optional schema lives at `<table>/.pod-schema.xml` and declares columns
+  and defaults:
 
-```bash
-# pod health check
-curl http://localhost:8082/health
-
-# Forms health
-curl http://localhost:8082/api/forms
-
-# Form submission health
-curl -X POST http://localhost:8082/api/submit -d '{"form_id":"test","data":{"test":"data"}}'
-
-# Configuration health
-curl http://localhost:8082/pod/config
+```xml
+<schema table="acme/contacts" version="2">
+  <column name="name" type="text"/>
+  <column name="age" type="int" default="0"/>
+</schema>
 ```
 
-### Metrics Collection
+- Records keep `id`, `schema_version`, `version`, `created`, and `updated`
+  metadata attributes.
 
-pod collects and reports:
+## HTTP API
 
-- **Form Status**: All configured forms status
-- **Form Usage**: Form creation and submission statistics
-- **Database Performance**: Database query performance
-- **API Performance**: HTTP request/response metrics
-- **Error Rates**: Form submission error tracking
-- **Data Storage**: Database storage metrics
+All responses are JSON by default; `?format=xml|json|html` or `Accept:`
+headers switch the format. HTML form POSTs use the Post/Redirect/Get pattern
+(303 → table page with a `notice`).
 
-## Security Features
+| Route | Methods | Purpose |
+|---|---|---|
+| `{mount}/` | GET | index page / table list |
+| `{mount}/health` | GET | JSON health (versions, index, normalizer status) |
+| `{mount}/tables` | GET / POST | list tables · create/update a schema |
+| `{mount}/table/<path>` | GET / POST / PUT | query records (`?field=value` filters, `?q=` free text, `?limit=&offset=&orderby=&dir=`) · upsert a record (HTML form action) |
+| `{mount}/record/<table>/<id>` | GET / PUT / POST / DELETE | fetch, update, delete one record (`_action=delete` on POST) |
+| `{mount}/schema/<path>` | GET | table schema (JSON/XML) |
+| `{mount}/sql?sql=…` | GET / POST | run SQL (form field, `?sql=`, or JSON `{"sql","args"}`) |
+| `{mount}/normalize` | POST | run the normalizer now |
+| `{mount}/reindex` | POST | run the indexer sync now |
 
-### pod Security
+### Request bodies
 
-- **SQLite Database Security**: Encrypted database backup storage
-- **Input Validation**: Prevents SQL injection and data corruption
-- **Access Control**: Role-based access to database functionality
-- **Data Encryption**: Encrypts sensitive data in the database
-- **Audit trails**: Tracks all database access and modifications
-- **Form Security**: Secure form submission and validation
+`application/x-www-form-urlencoded` and `multipart/form-data` (what HTML forms
+produce), `application/json`, and `application/xml` (a `<record>` document) are
+all accepted. JSON may be flat (`{"id":"1","name":"Jane"}`) or use the
+response shape (`{"id":"1","fields":{"name":"Jane"}}`).
 
-### Database Security
+Reserved body/query keys: `id`, `_id`, `_action`, `format`, `limit`, `offset`,
+`orderby`, `order`, `dir`, `q`, `sql`.
 
-pod provides secure database handling:
+## SQL dialect (database/sql driver and `/sql` endpoint)
 
-- **Database Encryption**: Encrypted SQLite database storage
-- **Access Control**: Role-based access control for database operations
-- **Input Validation**: Comprehensive input validation and sanitization
-- **Audit Logging**: Complete audit trails for all database operations
-- **Backup**: Automated database backup and recovery
-- **Performance Monitoring**: Database performance monitoring
+Same engine in both places. Supported:
 
-## Troubleshooting
+- `CREATE TABLE t (col TYPE, col2 TYPE DEFAULT 'x')`, `DROP TABLE t`
+- `INSERT INTO t (id, col) VALUES ('1', 'x')` — duplicate ids error
+- `UPSERT INTO t (id, col) VALUES (..., ...)` — overwrite
+- `SELECT cols|* FROM t WHERE … ORDER BY col ASC|DESC LIMIT n OFFSET n`
+- `UPDATE t SET col = ? WHERE …`, `DELETE FROM t WHERE …`
+- `?` placeholders; WHERE supports `= != <> > >= < <= LIKE NOT LIKE IS [NOT] NULL`
+  and parentheses with AND/OR.
 
-### Common Issues
+Transactions are **autocommit**: each statement commits on its own; `Commit` /
+`Rollback` are no-ops — that is what single-writer filesystem semantics allow.
 
-1. **Database Connection Failed**
-   ```bash
-   # Check pod logs
-   $ tail -f pod.log
-   
-   # Test database connection
-   $ sqlite3 ./data/pod.db "SELECT 1;"
-   
-   # Check pod health
-   $ curl http://localhost:8082/health
-   ```
+## Background services
 
-2. **Form Not Loading**
-   ```bash
-   # Check form status
-   $ curl http://localhost:8082/api/forms
-   
-   # Check database
-   $ sqlite3 ./data/pod.db "SELECT * FROM forms;"
-   
-   # Check pod logs
-   $ tail -f pod.log
-   ```
+- **Indexer** keeps a live in-memory index and record cache per base directory
+  (`Index`), so equality queries narrow candidates instead of re-reading every
+  file, and `SELECT`s avoid re-parsing unchanged XML. Writes update the index
+  eagerly; the indexer sync catches out-of-band file edits (for example a
+  backup restore). All stores opened on one base path share the index, so any
+  number of `sql.Open("pod", base)` connections see each other's writes.
+- **Normalizer** upgrades older record files to the current schema: when a
+  schema gains a column with a default, records missing that field are
+  backfilled (existing values are **never** overwritten).
 
-3. **Form Submission Failed**
-   ```bash
-   # Check form submission
-   $ curl -X POST http://localhost:8082/api/submit -d '{"form_id":"test","data":{"test":"data"}}'
-   
-   # Check database errors
-   $ tail -f pod.log
-   
-   # Test database connection
-   $ sqlite3 ./data/pod.db "PRAGMA integrity_check;"
-   ```
+## Current status and honest limitations
 
-### Debugging Commands
+- Symlink-based sharing is **not implemented** yet.
+- Per-value **encryption** of stored values is **not implemented** yet — values
+  are stored as plain XML text.
+- Values are strings; `int`/`float`/`bool`/`date` column types are advisory
+  (comparisons are numeric-aware when values parse as numbers).
+- The index is authoritative for equality narrowing only after a table has been
+  scanned by the indexer; files written directly on disk are picked up on the
+  next sync (or by hitting `/reindex`).
+- No authentication or authorization is built in — pod serves whoever reaches
+  the port. Put it behind your own auth layer (see SECURITY.md).
 
-```bash
-# Enable debug logging
-export POD_LOG_LEVEL=debug
+## Config example
 
-# Check pod logs
-$ tail -f pod.log
-
-# Monitor system resources
-$ top
-$ free -h
-
-# Test forms API
-$ curl http://localhost:8082/api/forms
-$ curl http://localhost:8082/api/data
-
-# Check pod configuration
-$ curl http://localhost:8082/pod/config
+```sh
+pod-server -port 8080 -db /srv/pod/data -index-interval 5s -normalize-interval 30s
 ```
 
-## API Specifications
+## Layout
 
-### High Maturity API (REST-based)
-
-```http
-GET /api/forms
-POST /api/forms
-GET /api/forms/{id}
-PUT /api/forms/{id}
-DELETE /api/forms/{id}
-POST /api/submit
-GET /api/data
-GET /health
 ```
-
-### pod-specific Endpoints
-
-```http
-GET /pod/config - HTML config viewer
-POST /pod/config - HTML config updater
-GET /pod/admin - HTML admin panel
-POST /pod/admin - HTML admin updater
+doc.go, store.go      core store (filesystem XML database)
+record.go, schema.go  XML record / schema types
+cond.go               predicate/condition matcher (SQL WHERE engine)
+index.go, indexer.go  shared in-memory index + sync service
+normalizer.go         schema-default backfill service
+statement.go          SQL tokenizer / parser / executor
+driver.go             database/sql driver ("pod")
+handler.go            HTTP handler (forms + JSON/XML API + UI)
+ui/*.html             embedded vanilla HTML form interface
+cmd/pod/              standalone server binary
+legacy/current_gen/   previous(2025) JSON-REST generation (parked, own go.mod)
+legacy/pod/           earlier XML + database/sql generations (parked reference)
 ```
-
-## Future Enhancements
-
-### Planned Features
-
-1. **Advanced Forms**: Complex form builder and validation
-2. **Multi-database Support**: Support for multiple database backends
-3. **Form Analytics**: Form usage analytics and reporting
-4. **Advanced Security**: Enhanced security features
-5. **Form Templates**: Predefined form templates
-
-### Roadmap
-
-- **Phase 1**: Basic form creation and submission
-- **Phase 2**: Form storage and data management
-- **Phase 3**: Advanced form features and validation
-- **Phase 4**: Form analytics and reporting
-
-## Conclusion
-
-pod provides an intuitive HTML form-based database solution that makes it easy to manage and interact with data using familiar HTML form interfaces. It eliminates the need for complex database management expertise while providing powerful database functionality.
-
-Key benefits:
-
-- **Form Interface**: User-friendly HTML form interface
-- **Database Functionality**: Full database functionality through forms
-- **No Configuration**: Out-of-the-box functionality without setup complexity
-- **Secure Storage**: Secure database storage with encryption
-- **Easy Integration**: Seamless integration with ATP platform
-- **Production Ready**: Comprehensive error handling and monitoring
-
-The pod implementation is production-ready and can be easily integrated into enterprise applications with comprehensive form-based database functionality.
-
----
-
-*Document Version: 1.0*
-*Created: 2026-08-25*
-*Last Updated: 2026-08-25*
-*Status: Production Ready*
-
-**License:** MIT License © Azzurro Technology Inc.
