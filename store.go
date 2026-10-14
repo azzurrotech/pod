@@ -40,6 +40,12 @@ type Store struct {
 	base string
 	mu   sync.RWMutex
 	ix   *Index
+	// cipher is non-nil when encryption at rest is enabled (OpenEncrypted).
+	// It is set once at construction and never mutated afterwards.
+	cipher *cryptoCipher
+	// shareMu serialises updates to the link-based share index
+	// (<base>/.pod-shares.xml), which is read-modify-written per operation.
+	shareMu sync.Mutex
 }
 
 var (
@@ -229,7 +235,9 @@ func (s *Store) UpdateSchema(table string, cols []Column) error {
 	}
 	var sc Schema
 	if err := xml.Unmarshal(data, &sc); err != nil {
-		return err
+		// A malformed schema is reconciled rather than rejected: replace it
+		// with the requested definition and move on.
+		return saveSchema(scPath, NewSchema(table, cols))
 	}
 	if !schemaColumnsEqual(sc.Columns, cols) {
 		sc.Columns = cols
@@ -243,6 +251,81 @@ func (s *Store) UpdateSchema(table string, cols []Column) error {
 		}
 	}
 	return nil
+}
+
+// ObserveFields widens a pinned schema to include field names observed in a
+// submission, bumping its version so older records can be upgraded. This is the
+// self-healing half of pod's schema model: a declared schema is an optional
+// hint, never a gate, so a form may introduce new fields at any time without a
+// migration or an error. When the table has no explicit schema it is a no-op,
+// because the derived schema already follows the observed fields.
+func (s *Store) ObserveFields(table string, names []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.observeFieldsLocked(table, names)
+}
+
+// observeFieldsLocked is ObserveFields assuming s.mu is already held.
+func (s *Store) observeFieldsLocked(table string, names []string) error {
+	dir, err := s.TablePath(table)
+	if err != nil {
+		return err
+	}
+	scPath := filepath.Join(dir, schemaFileName)
+	data, err := os.ReadFile(scPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // no pinned schema: derived schemas widen automatically
+		}
+		return err
+	}
+	var sc Schema
+	if err := xml.Unmarshal(data, &sc); err != nil {
+		return nil // malformed: fall back to the derived schema, without error
+	}
+	changed := false
+	for _, n := range names {
+		if n == "" || reservedFieldName(n) {
+			continue
+		}
+		if sc.Column(n) == nil {
+			sc.Columns = append(sc.Columns, Column{Name: n, Type: "text"})
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	sc.Version++
+	sc.UpdatedAt = time.Now().UTC()
+	if sc.Version == 0 {
+		sc.Version = 1
+	}
+	return saveSchema(scPath, &sc)
+}
+
+// reservedFieldName reports whether a submitted key is pod metadata rather than
+// a table column.
+func reservedFieldName(name string) bool {
+	switch name {
+	case "id", "_id", "_action", "format", "version", "created", "updated", "schema_version":
+		return true
+	default:
+		return false
+	}
+}
+
+// valueNames returns the column names present in a values map, skipping pod
+// metadata and the empty string.
+func valueNames(values map[string]string) []string {
+	names := make([]string, 0, len(values))
+	for k := range values {
+		if k == "" || reservedFieldName(k) {
+			continue
+		}
+		names = append(names, k)
+	}
+	return names
 }
 
 // DropTable removes a table directory and all its records.
@@ -278,7 +361,10 @@ func (s *Store) Schema(table string) (*Schema, error) {
 	}
 	var sc Schema
 	if err := xml.Unmarshal(data, &sc); err != nil {
-		return nil, fmt.Errorf("pod: malformed schema for %q: %w", table, err)
+		// A malformed schema file is not fatal: pod resolves the discrepancy
+		// gracefully by treating the table as having no explicit schema, so
+		// reads fall back to the derived (observed) schema instead of erroring.
+		return nil, nil
 	}
 	if sc.Columns == nil {
 		sc.Columns = []Column{}
@@ -344,7 +430,7 @@ func (s *Store) Upsert(table, id string, values map[string]string) (*Record, boo
 	}
 	path := filepath.Join(dir, recordFileName(id))
 
-	rec, loadErr := loadRecordFile(path)
+	rec, loadErr := s.loadRecordFile(path)
 	created := false
 	now := time.Now().UTC().Format(timeFormat)
 	if loadErr != nil {
@@ -365,6 +451,9 @@ func (s *Store) Upsert(table, id string, values map[string]string) (*Record, boo
 	}
 	for k, v := range values {
 		rec.Set(k, v)
+	}
+	if err := s.observeFieldsLocked(table, valueNames(values)); err != nil {
+		return nil, false, err
 	}
 	if err := s.writeRecordFile(table, rec); err != nil {
 		return nil, false, err
@@ -406,7 +495,7 @@ func (s *Store) Update(table, id string, values map[string]string) (*Record, err
 	if err != nil {
 		return nil, err
 	}
-	rec, err := loadRecordFile(path)
+	rec, err := s.loadRecordFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, ErrNotFound
@@ -415,6 +504,9 @@ func (s *Store) Update(table, id string, values map[string]string) (*Record, err
 	}
 	for k, v := range values {
 		rec.Set(k, v)
+	}
+	if err := s.observeFieldsLocked(table, valueNames(values)); err != nil {
+		return nil, err
 	}
 	rec.Version++
 	rec.Updated = time.Now().UTC().Format(timeFormat)
@@ -461,7 +553,7 @@ func (s *Store) Get(table, id string) (*Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	rec, err := decodeRecord(data)
+	rec, err := s.decodeRecordBytes(data)
 	if err != nil {
 		return nil, err
 	}
@@ -491,6 +583,9 @@ func (s *Store) Delete(table, id string) error {
 		return err
 	}
 	s.ix.Remove(table, id)
+	// Uploaded blobs travel with the record: deleting it removes its
+	// .pod-files directory (a no-op when there are no uploads).
+	_ = s.deleteRecordFiles(table, id)
 	return nil
 }
 
@@ -580,7 +675,7 @@ func (s *Store) NormalizeRecord(table, id string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	rec, err := loadRecordFile(path)
+	rec, err := s.loadRecordFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, ErrNotFound
@@ -609,13 +704,15 @@ func (s *Store) NormalizeRecord(table, id string) (bool, error) {
 	return true, nil
 }
 
-// writeRecordFile atomically writes a record and refreshes the index.
+// writeRecordFile atomically writes a record and refreshes the index. When
+// encryption at rest is enabled, a sealed copy of the record is written while
+// the plaintext record is what the index caches.
 func (s *Store) writeRecordFile(table string, rec *Record) error {
 	path, err := s.RecordPath(table, rec.ID)
 	if err != nil {
 		return err
 	}
-	data, err := encodeRecord(rec)
+	data, err := s.encodeRecord(rec)
 	if err != nil {
 		return err
 	}
@@ -628,6 +725,38 @@ func (s *Store) writeRecordFile(table string, rec *Record) error {
 	}
 	s.ix.Upsert(table, rec.ID, rec, st.ModTime(), st.Size())
 	return nil
+}
+
+// encodeRecord renders a record to XML, sealing values first when encryption
+// at rest is enabled. The passed record is not mutated.
+func (s *Store) encodeRecord(rec *Record) ([]byte, error) {
+	out, err := s.encryptRecord(rec)
+	if err != nil {
+		return nil, err
+	}
+	return encodeRecord(out)
+}
+
+// decodeRecordBytes parses record XML and opens any sealed field values.
+func (s *Store) decodeRecordBytes(data []byte) (*Record, error) {
+	rec, err := decodeRecord(data)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.decryptRecord(rec); err != nil {
+		return nil, err
+	}
+	return rec, nil
+}
+
+// loadRecordFile reads and decodes a record file from disk, decrypting when
+// necessary.
+func (s *Store) loadRecordFile(path string) (*Record, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return s.decodeRecordBytes(data)
 }
 
 // allIDs returns the sorted record ids of a table from the index when

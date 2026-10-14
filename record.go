@@ -4,18 +4,43 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"os"
-	"sort"
 )
 
 // timeFormat is the canonical timestamp layout used for record metadata.
 const timeFormat = "2006-01-02T15:04:05.999999999Z07:00"
 
 // Field is a single key/value pair inside a record.
+//
+// A plain text control only uses Name and Value. Uploaded files additionally
+// carry the metadata attributes below (Kind="file", Filename, ContentType,
+// Size, SHA256) and encryption at rest tags a value with Enc="aes-256-gcm".
+// The extra attributes are omitted from XML when empty, so ordinary records
+// stay byte-for-byte as before.
 type Field struct {
 	Name  string `xml:"name,attr"`
 	Value string `xml:",chardata"`
+
+	// Kind is empty for an ordinary field or "file" for an uploaded blob
+	// reference. It is advisory metadata and never changes query semantics.
+	Kind string `xml:"kind,attr,omitempty"`
+	// Filename is the original, client-supplied file name (display only; the
+	// stored name is always sanitised and server-generated).
+	Filename string `xml:"filename,attr,omitempty"`
+	// ContentType is the client-supplied MIME type of an uploaded file.
+	ContentType string `xml:"content_type,attr,omitempty"`
+	// Size is the byte length of the stored blob (ciphertext length when
+	// encryption at rest is enabled).
+	Size int64 `xml:"size,attr,omitempty"`
+	// SHA256 is the lowercase hex digest of the stored bytes.
+	SHA256 string `xml:"sha256,attr,omitempty"`
+	// Enc names the at-rest cipher that protects Value, or "" for plaintext.
+	// Reads decrypt transparently; plaintext and ciphertext may coexist in one
+	// table.
+	Enc string `xml:"enc,attr,omitempty"`
 }
+
+// IsFile reports whether the field holds a file-upload reference.
+func (f Field) IsFile() bool { return f.Kind == "file" }
 
 // Record is one row of the database. It serializes to and from a single XML
 // file of the form:
@@ -66,6 +91,34 @@ func (r *Record) Set(name, value string) bool {
 	}
 	r.Fields = append(r.Fields, Field{Name: name, Value: value})
 	return true
+}
+
+// SetField inserts or replaces a whole field, matching on the field name and
+// preserving every metadata attribute (Kind, Filename, Enc, …). It reports
+// whether the stored field changed. This is how file uploads and encryption
+// attach metadata that plain Set would drop.
+func (r *Record) SetField(f Field) bool {
+	for i := range r.Fields {
+		if r.Fields[i].Name == f.Name {
+			if r.Fields[i] == f {
+				return false
+			}
+			r.Fields[i] = f
+			return true
+		}
+	}
+	r.Fields = append(r.Fields, f)
+	return true
+}
+
+// Field returns the full field definition with the given name, if present.
+func (r *Record) Field(name string) (Field, bool) {
+	for i := range r.Fields {
+		if r.Fields[i].Name == name {
+			return r.Fields[i], true
+		}
+	}
+	return Field{}, false
 }
 
 // DeleteField removes a field if present and reports whether it was removed.
@@ -119,36 +172,4 @@ func decodeRecord(data []byte) (*Record, error) {
 		return nil, errors.New("pod: record XML is missing the id attribute")
 	}
 	return &r, nil
-}
-
-// loadRecordFile reads and decodes a record file from disk.
-func loadRecordFile(path string) (*Record, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return decodeRecord(data)
-}
-
-// sortedFieldNames returns the union of field names collected from records,
-// in first-seen order, then sorted. Used for derived schemas and SELECT *.
-func sortedFieldNames(recs []*Record, limit int) []string {
-	if limit <= 0 {
-		limit = len(recs)
-	}
-	seen := map[string]struct{}{}
-	var names []string
-	for _, r := range recs {
-		if r == nil {
-			continue
-		}
-		for _, f := range r.Fields {
-			if _, ok := seen[f.Name]; !ok {
-				seen[f.Name] = struct{}{}
-				names = append(names, f.Name)
-			}
-		}
-	}
-	sort.Strings(names)
-	return names
 }

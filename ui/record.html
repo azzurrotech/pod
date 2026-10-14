@@ -33,7 +33,15 @@
 <table>
   <tbody>
   {{range .Record.Fields}}
-    <tr><th>{{.Name}}</th><td>{{.Value}}</td></tr>
+    <tr>
+      <th>{{.Name}}{{if .Kind}} · {{.Kind}}{{end}}</th>
+      <td>
+        {{if .IsFile}}
+          <a href="{{$.Mount}}/files/{{esc $.Table}}/{{esc $.ID}}/{{base .Value}}">{{.Filename}}</a>
+          <small>{{.ContentType}} · {{.Size}} bytes · sha256 {{.SHA256}}</small>
+        {{else}}{{.Value}}{{end}}
+      </td>
+    </tr>
   {{end}}
   {{if not .Record.Fields}}<tr><td colspan="2">no fields — this record only has metadata.</td></tr>{{end}}
   </tbody>
@@ -47,12 +55,18 @@
 </dl>
 
 <h2>Edit</h2>
-<form method="post" action="{{.Href}}">
+<form method="post" action="{{.Href}}" enctype="multipart/form-data">
   <input type="hidden" name="_action" value="update">
   {{range .Schema}}
+  {{if isfile $.Record .Name}}
+  <label>{{.Name}} — replace uploaded file
+    <input type="file" name="{{.Name}}">
+  </label>
+  {{else}}
   <label>{{.Name}}{{if .Type}} ({{.Type}}){{end}}{{if .Default}} · default {{.Default}}{{end}}
     <input type="text" name="{{.Name}}" value="{{field $.Record .Name}}">
   </label>
+  {{end}}
   {{end}}
   <div><button type="submit">Update record</button></div>
 </form>

@@ -244,7 +244,7 @@ func (x *Indexer) reindexTableFile(table string, e fs.DirEntry) (*cacheEntry, er
 	if err != nil {
 		return nil, err
 	}
-	rec, err := loadRecordFile(filepath.Join(dir, e.Name()))
+	rec, err := x.store.loadRecordFile(filepath.Join(dir, e.Name()))
 	if err != nil {
 		return nil, err
 	}

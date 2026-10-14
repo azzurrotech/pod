@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +29,10 @@ type HandlerOptions struct {
 	// UI enables the embedded HTML form interface. A nil value means enabled;
 	// set it to a pointer to false to disable the UI.
 	UI *bool
+	// Auth optionally gates every route with the exposed auth helper
+	// (NewAuth / Wrap). When Auth has a Policy, pod also enforces it per
+	// table and action. A nil Auth leaves the server open.
+	Auth *Auth
 }
 
 // Handler serves the pod database over HTTP. It accepts request formats that
@@ -48,6 +54,12 @@ type HandlerOptions struct {
 //	POST {mount}/record/<path>/<id>        update or delete (_action=delete)
 //	DELETE {mount}/record/<path>/<id>      delete one record
 //	GET  {mount}/schema/<path>             fetch a table schema
+//	GET  {mount}/files/<table>/<id>/<name> download an uploaded file
+//	PUT  {mount}/files/<table>/<id>/<name> replace an uploaded file
+//	DELETE {mount}/files/<table>/<id>/<name> delete an uploaded file
+//	POST {mount}/share                     create a share link
+//	GET  {mount}/s/<token>                 resolve a share link
+//	DELETE {mount}/share/<token>           revoke a share link
 //	GET  {mount}/sql?sql=...               run SQL (database/sql engine)
 //	POST {mount}/sql                       run SQL (form field or JSON body)
 //	POST {mount}/normalize                 run the normalizer now
@@ -60,6 +72,7 @@ type Handler struct {
 	store      *Store
 	mount      string
 	ui         bool
+	auth       *Auth
 	tpl        *template.Template
 	indexer    *Indexer
 	normalizer *Normalizer
@@ -90,6 +103,7 @@ func NewHandler(o HandlerOptions) *Handler {
 		store:      o.Store,
 		mount:      mount,
 		ui:         ui,
+		auth:       o.Auth,
 		indexer:    NewIndexer(o.Store),
 		normalizer: NewNormalizer(o.Store),
 		started:    time.Now(),
@@ -106,6 +120,16 @@ func NewHandler(o HandlerOptions) *Handler {
 			},
 			// esc URL-escapes a single path segment for use in hrefs.
 			"esc": url.PathEscape,
+			// isfile reports whether a record's named field holds an upload.
+			"isfile": func(r *Record, name string) bool {
+				if r == nil {
+					return false
+				}
+				f, ok := r.Field(name)
+				return ok && f.IsFile()
+			},
+			// base returns the last segment of a slash-separated stored path.
+			"base": path.Base,
 		}
 		tpl, err := template.New("").Funcs(funcs).ParseFS(uiFS, "ui/*.html")
 		if err != nil {
@@ -210,6 +234,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleSchema(w, r, rest)
+	case p == "/share":
+		if r.Method != http.MethodPost {
+			h.methodNotAllowed(w, r)
+			return
+		}
+		h.handleCreateShare(w, r)
+	case strings.HasPrefix(p, "/share/"):
+		if r.Method != http.MethodDelete {
+			h.methodNotAllowed(w, r)
+			return
+		}
+		h.handleRevokeShare(w, r, strings.TrimPrefix(p, "/share/"))
+	case strings.HasPrefix(p, "/s/"):
+		if r.Method != http.MethodGet {
+			h.methodNotAllowed(w, r)
+			return
+		}
+		h.handleResolveShare(w, r, strings.TrimPrefix(p, "/s/"))
+	case strings.HasPrefix(p, "/files/"):
+		h.handleFiles(w, r, strings.TrimPrefix(p, "/files/"))
 	default:
 		h.writeError(w, r, http.StatusNotFound, "not found")
 	}
@@ -324,6 +368,85 @@ func (h *Handler) render(w http.ResponseWriter, r *http.Request, name string, da
 	}
 }
 
+// --- authorization ----------------------------------------------------------
+
+// authorize enforces the configured per-table, per-action policy. When no auth
+// helper (or no Policy) is wired it allows the request. It returns false after
+// writing a 401/403 response when the caller may not proceed.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, table, action string) bool {
+	// A valid share token presented as ?share=<token> is itself the
+	// authorization: it names an exact target and grants read (or, for a
+	// read/write share, write/delete) on it. Resolving it never calls
+	// os.Symlink — it is a plain lookup in the share index.
+	if tok := r.URL.Query().Get("share"); tok != "" {
+		if sh, err := h.store.ResolveShare(tok); err == nil && shareAllows(sh, table, action) {
+			return true
+		}
+	}
+	if h.auth == nil || !h.auth.policyConfigured() {
+		return true
+	}
+	p, ok := h.auth.Principal(r)
+	if !ok {
+		h.writeError(w, r, http.StatusUnauthorized, "authentication required")
+		return false
+	}
+	if !h.auth.Authorize(p, table, action) {
+		h.writeError(w, r, http.StatusForbidden, "forbidden: "+action+" on "+table)
+		return false
+	}
+	return true
+}
+
+// shareAllows reports whether a share grants an action on a table. A share
+// never grants the "share" action, so a bearer link cannot be re-shared.
+func shareAllows(sh *Share, table, action string) bool {
+	if sh == nil || sh.Table != table {
+		return false
+	}
+	switch action {
+	case "read":
+		return true
+	case "write", "delete":
+		return sh.Write
+	default:
+		return false
+	}
+}
+
+// attachUploads stores each uploaded blob next to the record and records a
+// file field for it, then persists the record. It is called after the text
+// values have produced (or updated) the record, so the generated id is known.
+func (h *Handler) attachUploads(table string, rec *Record, ups []fileUpload) error {
+	for _, u := range ups {
+		f, err := h.store.StoreUpload(table, rec.ID, u.Field, u.Filename, u.ContentType, u.Data)
+		if err != nil {
+			return err
+		}
+		rec.SetField(f)
+	}
+	// A file control is a column like any other: widen a pinned schema.
+	names := make([]string, 0, len(ups))
+	for _, u := range ups {
+		names = append(names, u.Field)
+	}
+	if err := h.store.ObserveFields(table, names); err != nil {
+		return err
+	}
+	rec.Version++
+	rec.Updated = time.Now().UTC().Format(timeFormat)
+	syncSchemaVersion(h.store, table, rec)
+	return h.store.writeRecordFile(table, rec)
+}
+
+// syncSchemaVersion stamps a record with the current explicit schema version,
+// when one exists.
+func syncSchemaVersion(s *Store, table string, rec *Record) {
+	if sc, err := s.Schema(table); err == nil && sc != nil {
+		rec.SchemaVersion = sc.Version
+	}
+}
+
 // --- body parsing -----------------------------------------------------------
 
 func (h *Handler) parseBody(r *http.Request) (map[string]string, error) {
@@ -376,6 +499,50 @@ func formValues(f url.Values) map[string]string {
 		m[k] = strings.Join(vs, "\n")
 	}
 	return m
+}
+
+// parseRequest parses a request body into text values plus any uploaded files.
+// It is parseBody plus multipart file extraction, and is what the create/upsert
+// paths use so that a multipart form carrying both controls and files stores
+// both. File parts are read into memory under maxUploadSize; an empty file
+// input (no bytes) is ignored, matching browser behaviour.
+func (h *Handler) parseRequest(r *http.Request) (map[string]string, []fileUpload, error) {
+	ct := r.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "multipart/form-data") {
+		vals, err := h.parseBody(r)
+		return vals, nil, err
+	}
+	if err := r.ParseMultipartForm(4 << 20); err != nil {
+		return nil, nil, err
+	}
+	vals := formValues(r.Form)
+	var ups []fileUpload
+	if r.MultipartForm != nil {
+		for field, fhs := range r.MultipartForm.File {
+			for _, fh := range fhs {
+				f, err := fh.Open()
+				if err != nil {
+					return nil, nil, err
+				}
+				data, rerr := readFilePart(f)
+				f.Close()
+				if rerr != nil {
+					return nil, nil, rerr
+				}
+				if len(data) == 0 {
+					continue // empty <input type="file"> — no file, no error
+				}
+				ups = append(ups, fileUpload{
+					Field:       field,
+					Filename:    filepath.Base(fh.Filename),
+					ContentType: fh.Header.Get("Content-Type"),
+					Data:        data,
+				})
+			}
+		}
+	}
+	sortUploads(ups)
+	return vals, ups, nil
 }
 
 func flattenJSON(obj map[string]interface{}) map[string]string {
@@ -614,6 +781,9 @@ func (h *Handler) handleCreateTable(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, http.StatusBadRequest, "missing table name")
 		return
 	}
+	if !h.authorize(w, r, table, "write") {
+		return
+	}
 	if err := h.store.UpdateSchema(table, cols); err != nil {
 		h.writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
@@ -683,6 +853,9 @@ func (h *Handler) handleSchema(w http.ResponseWriter, r *http.Request, table str
 		h.methodNotAllowed(w, r)
 		return
 	}
+	if !h.authorize(w, r, table, "read") {
+		return
+	}
 	sc, err := h.store.EffectiveSchema(table)
 	if err != nil {
 		h.writeError(w, r, http.StatusInternalServerError, err.Error())
@@ -711,6 +884,9 @@ func (h *Handler) handleSchema(w http.ResponseWriter, r *http.Request, table str
 func (h *Handler) handleTable(w http.ResponseWriter, r *http.Request, table string) {
 	switch r.Method {
 	case http.MethodGet:
+		if !h.authorize(w, r, table, "read") {
+			return
+		}
 		h.queryTable(w, r, table)
 	case http.MethodPost, http.MethodPut:
 		h.submitForm(w, r, table)
@@ -724,6 +900,7 @@ func (h *Handler) queryTable(w http.ResponseWriter, r *http.Request, table strin
 	reserved := map[string]bool{
 		"format": true, "limit": true, "offset": true,
 		"orderby": true, "order": true, "dir": true, "sql": true, "q": true,
+		"share": true,
 	}
 	var preds []Predicate
 	for k, vs := range q {
@@ -860,7 +1037,7 @@ func (h *Handler) queryTable(w http.ResponseWriter, r *http.Request, table strin
 }
 
 func (h *Handler) submitForm(w http.ResponseWriter, r *http.Request, table string) {
-	vals, err := h.parseBody(r)
+	vals, ups, err := h.parseRequest(r)
 	if err != nil {
 		h.writeError(w, r, http.StatusBadRequest, err.Error())
 		return
@@ -875,6 +1052,9 @@ func (h *Handler) submitForm(w http.ResponseWriter, r *http.Request, table strin
 	delete(vals, "id")
 	delete(vals, "_id")
 	if action == "delete" {
+		if !h.authorize(w, r, table, "delete") {
+			return
+		}
 		if id == "" {
 			h.writeError(w, r, http.StatusBadRequest, "record id required for delete (use id= or _id=)")
 			return
@@ -890,10 +1070,19 @@ func (h *Handler) submitForm(w http.ResponseWriter, r *http.Request, table strin
 		h.respondSubmit(w, r, table, nil, false)
 		return
 	}
+	if !h.authorize(w, r, table, "write") {
+		return
+	}
 	rec, created, err := h.store.Upsert(table, id, vals)
 	if err != nil {
 		h.writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if len(ups) > 0 {
+		if err := h.attachUploads(table, rec, ups); err != nil {
+			h.writeError(w, r, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	h.respondSubmit(w, r, table, rec, created)
 }
@@ -933,38 +1122,12 @@ func submitNotice(rec *Record, created bool) string {
 func (h *Handler) handleRecord(w http.ResponseWriter, r *http.Request, table, id string) {
 	switch r.Method {
 	case http.MethodGet:
-		rec, err := h.store.Get(table, id)
-		if err != nil {
-			if err == ErrNotFound {
-				h.writeError(w, r, http.StatusNotFound, err.Error())
-				return
-			}
-			h.writeError(w, r, http.StatusInternalServerError, err.Error())
+		if !h.authorize(w, r, table, "read") {
 			return
 		}
-		switch h.format(r) {
-		case "html":
-			sc, _ := h.store.EffectiveSchema(table)
-			var cols []Column
-			if sc != nil {
-				cols = sc.Columns
-			}
-			data := recordPageData{
-				Mount: h.mount, Table: table, ID: id,
-				Href:   h.url("/record/" + url.PathEscape(table) + "/" + url.PathEscape(id)),
-				Record: rec, Schema: cols,
-			}
-			if xmlData, err := encodeRecord(rec); err == nil {
-				data.XML = string(xmlData)
-			}
-			h.render(w, r, "record.html", data)
-		case "xml":
-			h.writeXML(w, http.StatusOK, rec)
-		default:
-			h.writeJSON(w, http.StatusOK, recordJSON(rec))
-		}
+		h.serveRecord(w, r, table, id)
 	case http.MethodPut, http.MethodPost:
-		vals, err := h.parseBody(r)
+		vals, ups, err := h.parseRequest(r)
 		if err != nil {
 			h.writeError(w, r, http.StatusBadRequest, err.Error())
 			return
@@ -977,11 +1140,17 @@ func (h *Handler) handleRecord(w http.ResponseWriter, r *http.Request, table, id
 		delete(vals, "format")
 		delete(vals, "_id")
 		if action == "delete" {
+			if !h.authorize(w, r, table, "delete") {
+				return
+			}
 			if err := h.store.Delete(table, id); err != nil {
 				h.writeError(w, r, http.StatusInternalServerError, err.Error())
 				return
 			}
 			h.respondSubmit(w, r, table, nil, false)
+			return
+		}
+		if !h.authorize(w, r, table, "write") {
 			return
 		}
 		rec, err := h.store.Update(table, id, vals)
@@ -993,8 +1162,17 @@ func (h *Handler) handleRecord(w http.ResponseWriter, r *http.Request, table, id
 			h.writeError(w, r, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if len(ups) > 0 {
+			if err := h.attachUploads(table, rec, ups); err != nil {
+				h.writeError(w, r, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
 		h.respondSubmit(w, r, table, rec, false)
 	case http.MethodDelete:
+		if !h.authorize(w, r, table, "delete") {
+			return
+		}
 		if err := h.store.Delete(table, id); err != nil {
 			if err == ErrNotFound {
 				h.writeError(w, r, http.StatusNotFound, err.Error())
@@ -1006,6 +1184,43 @@ func (h *Handler) handleRecord(w http.ResponseWriter, r *http.Request, table, id
 		h.respondSubmit(w, r, table, nil, false)
 	default:
 		h.methodNotAllowed(w, r)
+	}
+}
+
+// serveRecord writes one record in the negotiated format. It is shared by the
+// normal record route and by share resolution; it does not itself check
+// authorization, so callers enforce that first (or deliberately bypass it for a
+// bearer share link).
+func (h *Handler) serveRecord(w http.ResponseWriter, r *http.Request, table, id string) {
+	rec, err := h.store.Get(table, id)
+	if err != nil {
+		if err == ErrNotFound {
+			h.writeError(w, r, http.StatusNotFound, err.Error())
+			return
+		}
+		h.writeError(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
+	switch h.format(r) {
+	case "html":
+		sc, _ := h.store.EffectiveSchema(table)
+		var cols []Column
+		if sc != nil {
+			cols = sc.Columns
+		}
+		data := recordPageData{
+			Mount: h.mount, Table: table, ID: id,
+			Href:   h.url("/record/" + url.PathEscape(table) + "/" + url.PathEscape(id)),
+			Record: rec, Schema: cols,
+		}
+		if xmlData, err := encodeRecord(rec); err == nil {
+			data.XML = string(xmlData)
+		}
+		h.render(w, r, "record.html", data)
+	case "xml":
+		h.writeXML(w, http.StatusOK, rec)
+	default:
+		h.writeJSON(w, http.StatusOK, recordJSON(rec))
 	}
 }
 

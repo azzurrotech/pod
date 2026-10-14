@@ -2,7 +2,6 @@ package pod
 
 import (
 	"encoding/xml"
-	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -80,15 +79,6 @@ func (s *Schema) ApplyDefaults(values map[string]string) {
 	}
 }
 
-// schemaForRecord derives an implicit schema from a record's fields.
-func schemaForRecord(table string, r *Record) *Schema {
-	cols := make([]Column, 0, len(r.Fields))
-	for _, f := range r.Fields {
-		cols = append(cols, Column{Name: f.Name, Type: "text"})
-	}
-	return NewSchema(table, cols)
-}
-
 // saveSchema writes the schema file atomically.
 func saveSchema(path string, s *Schema) error {
 	body, err := xml.MarshalIndent(s, "", "  ")
@@ -98,18 +88,6 @@ func saveSchema(path string, s *Schema) error {
 	out := append([]byte(xml.Header), body...)
 	out = append(out, '\n')
 	return atomicWriteFile(path, out, 0644)
-}
-
-func loadSchema(path string) (*Schema, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var s Schema
-	if err := xml.Unmarshal(data, &s); err != nil {
-		return nil, fmt.Errorf("pod: malformed schema %s: %w", path, err)
-	}
-	return &s, nil
 }
 
 // atomicWriteFile writes data to a temp file in the target directory and

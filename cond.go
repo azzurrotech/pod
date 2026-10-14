@@ -63,13 +63,6 @@ type Cond interface {
 	Match(r *Record) bool
 }
 
-type condAll struct{}
-
-func (condAll) Match(*Record) bool { return true }
-
-// CondAll returns a condition that matches every record.
-func CondAll() Cond { return condAll{} }
-
 // PredCond wraps a single predicate.
 type PredCond struct{ P Predicate }
 
