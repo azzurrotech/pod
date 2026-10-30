@@ -442,6 +442,40 @@ p.RunBackground(ctx, 5*time.Second, 30*time.Second) // indexer + normalizer
   schema gains a column with a default, records missing that field are
   backfilled (existing values are **never** overwritten).
 
+## Exporting records
+
+Every pod-backed application eventually has to hand a record set to something
+that is not pod: a spreadsheet, a report, another service. `export.go` is the one
+implementation of that last mile, so an application does not invent a second CSV
+writer (usually with different quoting and no byte-order mark):
+
+```go
+// records from a query
+err := pod.ExportRecords(w, records, pod.ExportOptions{
+    Format:  pod.FormatCSV,                     // or pod.FormatJSON (default)
+    Columns: []pod.ExportColumn{
+        {Field: "id"},
+        {Field: "name", Header: "Project"},
+    },
+})
+
+// or rows the application already projected
+err = pod.ExportTable(w, header, rows, pod.ExportOptions{Format: pod.FormatCSV})
+```
+
+- **JSON** is an array of objects keyed by the header.
+- **CSV** carries a UTF-8 BOM by default (`NoBOM: true` suppresses it) and is
+  written with `encoding/csv`, so commas, quotes and newlines in analyst text
+  survive the round trip.
+- **No columns** means the union of the records' fields, with `id` first — the
+  record id lives in the XML attribute, and the exporter reads it from there.
+- `ContentType`, `Extension` and `ExportFilename` give the HTTP conventions
+  (`ExportFilename("my export", FormatCSV) == "my-export.csv"`), and an unknown
+  format is an error rather than a silent JSON fallback.
+
+The helpers operate on field values, not on a model, so the same code exports a
+project catalogue or an OSINT feed.
+
 ## Current status and honest limitations
 
 - **No built-in login.** pod exposes the auth helper; if you do not wire it, the
